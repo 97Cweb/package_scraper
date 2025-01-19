@@ -83,7 +83,7 @@ def fetch_email_ids(mail, folder="inbox", scan_all=False):
 
         filtered_ids = []
         
-        for i in range(len(email_ids)):
+        for i in reversed(range(len(email_ids))):
             email_id = email_ids[i]
             print(f"checking: {i}")
             status, msg_data = mail.fetch(email_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
@@ -97,8 +97,10 @@ def fetch_email_ids(mail, folder="inbox", scan_all=False):
                     if msg_date:
                         try:
                             email_date = parsedate_to_datetime(msg_date)
-                            if email_date > last_scan_date:
-                                filtered_ids.append(email_id)
+                            if email_date <= last_scan_date:
+                                print("Encountered email older than last scan date. Stopping.")
+                                return filtered_ids  # Stop processing earlier emails
+                            filtered_ids.append(email_id)
                         except Exception as e:
                             print(f"Error parsing email date: {e}")
         return filtered_ids
@@ -108,58 +110,81 @@ def fetch_email_ids(mail, folder="inbox", scan_all=False):
 
 # Function to fetch and process a single email
 def process_email(mail, email_id, openai_client):
-    email_data = {}
+    """
+    Process a single email and extract order and shipping details.
+    """
+    try:
+        email_data = fetch_and_parse_email(mail, email_id)
+        if not email_data:
+            return None
+
+        # Ignore specific senders (e.g., PayPal)
+        if any(domain in email_data.get("from", "").lower() for domain in ["amazon.com", "amazon.ca","paypal.com"]):
+            print(f"Ignored email from {email_data['from']}")
+            return None
+
+        # Extract order and shipping information using GPT
+        parsed_data = extract_with_gpt(email_data, openai_client)
+        if not parsed_data or "order_number" not in parsed_data:
+            print(f"Skipped email: No order number found for email ID {email_id}")
+            return None
+
+        # Merge extracted data into email_data
+        email_data.update(parsed_data)
+        return email_data
+
+    except Exception as e:
+        print(f"Failed to process email ID {email_id}: {e}")
+        return None
+
+def fetch_and_parse_email(mail, email_id):
+    """
+    Fetch and parse an email by ID.
+    """
     try:
         status, msg_data = mail.fetch(email_id, '(RFC822)')
         if status != "OK":
             print(f"Failed to fetch email ID {email_id}")
             return None
+
         for response_part in msg_data:
             if isinstance(response_part, tuple):
-                # Parse the email content
                 msg = email.message_from_bytes(response_part[1])
-                # Decode the subject
-                subject, encoding = decode_header(msg["Subject"])[0]
-                if isinstance(subject, bytes):
-                    subject = subject.decode(encoding if encoding else "utf-8")
-                email_data['subject'] = subject
 
-                # Get the sender
+                # Extract headers
+                subject, encoding = decode_header(msg.get("Subject", ""))[0]
+                subject = subject.decode(encoding if encoding else "utf-8") if isinstance(subject, bytes) else subject
                 email_from = msg.get("From")
-                email_data['from'] = email_from
+                date_received = parse_email_date(msg.get("Date"))
 
-                # Get the date received
-                date_header = msg.get("Date")
-                if date_header:
-                    try:
-                        date_received = parsedate_to_datetime(date_header).isoformat()
-                    except Exception as e:
-                        print(f"Error parsing date: {e}")
-                        date_received = date_header  # Use the raw date string if parsing fails
-                else:
-                    date_received = None
-                email_data['date_received'] = date_received
-
-                # Ignore emails from PayPal
-                if "paypal.com" in email_from.lower():
-                    print(f"Ignored email from PayPal: {email_from}")
-                    return None
-
-                # Extract order and shipping numbers using GPT
+                # Extract body
                 body = extract_email_body(msg)
                 cleaned_body = clean_email_body(body)
-                email_data['body'] = cleaned_body  # Add the cleaned body to email_data
-                
-        # Extract order and shipping information using GPT
-        email_data.update(extract_with_gpt(email_data, openai_client))
-        del email_data['body']
-        if "order_number" not in email_data:
-            return None
-        
+
+                return {
+                    "subject": subject,
+                    "from": email_from,
+                    "date_received": date_received,
+                    "body": cleaned_body,
+                }
+
     except Exception as e:
-        print(f"Failed to process email ID {email_id}: {e}")
+        print(f"Error fetching or parsing email ID {email_id}: {e}")
         return None
-    return email_data
+
+
+
+def parse_email_date(date_header):
+    """
+    Parse the email date header into ISO format.
+    """
+    try:
+        if date_header:
+            return parsedate_to_datetime(date_header).isoformat()
+    except Exception as e:
+        print(f"Error parsing email date: {e}")
+    return None
+
 
 # Function to extract the email body
 def extract_email_body(msg):
@@ -193,15 +218,22 @@ def clean_email_body(body):
 
 # Function to process GPT response
 def extract_with_gpt(email_data, openai_client):
+    """
+    Use GPT to extract order and shipping details from the email.
+    Includes logic to handle Amazon-specific emails and parse their statuses.
+    """
     try:
-        prompt = f"""Extract the order number, tracking/shipping number, company, and list of items in shipment from the following email.
-Output the result as a JSON object with keys: order_number, tracking_number, company, and items. Do not explain it, just return only the json
-Carriers such as canada post are not the company that shipped. Amazon is a company though as you can buy from them. 
+        prompt = f"""
+        Extract the order number, tracking/shipping number, company, and list of items in shipment from the following email.
+        Provide the output as a JSON object with the keys: order_number, tracking_number, company, status, delivery_date, and items.
+        Carriers such as Canada Post are not the company; for example, Amazon is the company. Only return the json, do not describe it
 
-Email Data:
-Subject: {email_data['subject']}
-From: {email_data['from']}
-Body: {email_data['body']}"""
+        Email Data:
+        Subject: {email_data['subject']}
+        From: {email_data['from']}
+        Body: {email_data['body']}
+        """
+
         completion = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -211,9 +243,17 @@ Body: {email_data['body']}"""
         )
         response = completion.choices[0].message.content
         return process_gpt_response(response)
+
     except Exception as e:
-        print(f"Error with GPT extraction: {e}")
-        return {"company": None, "items": [], "order_number": None, "tracking_number": None}
+        print(f"Error during GPT extraction: {e}")
+        return {
+            "order_number": None,
+            "tracking_number": None,
+            "status": None,
+            "delivery_date": None,
+            "items": [],
+        }
+
 
 # Function to handle GPT response
 def process_gpt_response(response):
@@ -285,7 +325,7 @@ def process_and_save_emails(openai_client, folder="inbox"):
 
         # Process new emails and merge data
         new_emails = []
-        for email_id in email_ids:
+        for email_id in reversed(email_ids):
             email_data = process_email(mail, email_id.encode(), openai_client)
             if email_data:
                 order_number = email_data.get("order_number")
@@ -335,7 +375,7 @@ import requests
 import json
 
 
-def check_package_status(api_key,postal_code):
+def update_package_status(api_key,postal_code):
     """
     Check the status of packages using the Ship24 API.
     Updates the email data with the tracking status and returns a list of delivered packages.
@@ -347,6 +387,10 @@ def check_package_status(api_key,postal_code):
         # Load the saved emails
         with open("emails.json", "r", encoding="utf-8") as file:
             emails = json.load(file)
+            
+        # Create a lookup dictionary by order_number for efficient updates
+        email_lookup = {email.get("order_number"): email for email in emails if email.get("order_number")}
+
 
         # Collect packages to track
         shipments = [
@@ -359,10 +403,10 @@ def check_package_status(api_key,postal_code):
             for email in emails
             if "tracking_number" in email
             and email["tracking_number"]
-            and email.get("status") != "delivery"
+            and email.get("status") not in {"delivered","archive"}
         ]
         
-        print(len(shipments))
+        print(f"Tracking {len(shipments)} shipments.")
         
         if not shipments:
             print("No packages to track.")
@@ -382,130 +426,189 @@ def check_package_status(api_key,postal_code):
                 cached_shipments = json_response.get("shipments", [])
             # Get UUID from response
             uuid = response.json().get("uuid")
-            if not uuid:
-                print("Failed to get UUID from tracking API.")
-                return []
+            
+            polled_shipments = []
+            if uuid:
 
-            # Poll tracking status using UUID
-            def poll_tracking_status():
-                status_url = tracking_url
-                while True:
-                    status_response = requests.get(status_url, params={"uuid": uuid, "apiKey": api_key})
-                    if status_response.status_code == 200:
-                        status_data = status_response.json()
+                # Poll tracking status using UUID
+                def poll_tracking_status():
+                    while True:
+                        status_response = requests.get(tracking_url, params={"uuid": uuid, "apiKey": api_key})
+                        if status_response.status_code == 200:
+                            status_data = status_response.json()
 
-                        # Check if all tracking is done
-                        if status_data.get("done", False):
-                            return status_data.get("shipments", [])
+                            # Check if all tracking is done
+                            if status_data.get("done", False):
+                                return status_data.get("shipments", [])
+                            else:
+                                print("Tracking in progress... Retrying in 10 seconds.")
+                                time.sleep(10)
                         else:
-                            print("Tracking in progress... Retrying in 10 seconds.")
-                            time.sleep(10)
-                    else:
-                        print(f"Error polling tracking status: {status_response.text}")
-                        break
-                return []
+                            print(f"Error polling tracking status: {status_response.text}")
+                            break
+                    return []
 
-            # Fetch the shipments from polling
-            polled_shipments = poll_tracking_status()
+                # Fetch the shipments from polling
+                polled_shipments = poll_tracking_status()
 
-            # Merge cached shipments with polled shipments
-            all_shipments = {shipment["trackingId"]: shipment for shipment in cached_shipments}
-            for shipment in polled_shipments:
-                all_shipments[shipment["trackingId"]] = shipment  # Add or update with polled data
-            
-            # Convert merged data back to a list
-            tracked_shipments = list(all_shipments.values())
-            
-
-            
-
-            # Process tracking results
-            for shipment in tracked_shipments:
+            for shipment in cached_shipments + polled_shipments:
                 tracking_number = shipment.get("trackingId")
-                states = shipment.get("states", [])
-                last_state = shipment.get("lastState", {})
                 status = shipment.get("status", "Unknown")
-                delivered_by = shipment.get("delivered_by")
-                events = []
+                delivered_by = shipment.get("delivered_by", None)
 
-                # Collect events from the states
-                for state in states:
-                    event = {
-                        "location": state.get("location"),
-                        "date": state.get("date"),
-                        "status": state.get("status")
-                    }
-                    events.append(event)
-
-                # Extract latest event details from lastState
-                latest_event_status = last_state.get("status", "Unknown")
-                latest_event_date = last_state.get("date", "Unknown")
-                latest_event_location = last_state.get("location", "Unknown")
-
-                # Update the corresponding email entry
+                # Update the corresponding email by order_number
                 for email in emails:
                     if email.get("tracking_number") == tracking_number:
-                        #check if status changed to delivered
-                        if email["status"] != status:
-                            if status.lower() == "delivered":
-                                delivered_packages.append(email)
-                                print(f"Package {tracking_number} marked as delivered.")
-                        #update all fields
                         email["status"] = status
                         email["delivered_by"] = delivered_by
-                        email["events"] = events
-                        email["latest_event"] = {
-                            "status": latest_event_status,
-                            "date": latest_event_date,
-                            "location": latest_event_location
-                        }
 
-                            
+                        # Check if status changed to delivered
+                        if status.lower() == "delivered" and email not in delivered_packages:
+                            delivered_packages.append(email)
+                            print(f"Package {tracking_number} marked as delivered.")
 
-        else:
-            print(f"Failed to initiate tracking request: {response.status_code}, {response.text}")
+        # Process Amazon emails
+        for email in emails:
+            if any(domain in email.get("from", "").lower() for domain in ["amazon.com", "amazon.ca"]):
+                print(f"Processing Amazon email: {email['subject']}")
 
-        # Save the updated emails back to the JSON file
+                # Use GPT to extract status from Amazon emails
+                parsed_data = extract_with_gpt(email, openai_client)
+                if parsed_data:
+                    order_number = parsed_data.get("order_number")
+                    if order_number and order_number in email_lookup:
+                        # Update existing email entry
+                        email_lookup[order_number].update(parsed_data)
+                    elif order_number:
+                        # Add new entry if not already present
+                        email_lookup[order_number] = parsed_data
+
+                    # Check for delivered status
+                    status = str(parsed_data.get("status", "")).lower()
+                    if status == "delivered" and parsed_data not in delivered_packages:
+                        delivered_packages.append(parsed_data)
+                        print(f"Amazon package {order_number} marked as delivered.")
+
+        # Save updated emails back to the JSON file
+        updated_emails = list(email_lookup.values())
         with open("emails.json", "w", encoding="utf-8") as file:
-            json.dump(emails, file, indent=4)
+            json.dump(updated_emails, file, indent=4) 
+
 
     except Exception as e:
         print(f"Error checking package status: {e}")
 
     return delivered_packages
 
-def filter_emails_with_tracking(emails):
+def filter_and_save_tracking_emails(input_file, output_file):
     """
-    Filters the emails to include only those with a valid tracking number and status not 'Delivered'.
+    Filters emails with valid tracking numbers and undelivered statuses.
+    Saves the filtered emails to a new file for tracking purposes.
     """
-    filtered_emails = [
-        email for email in emails
-        if "tracking_number" in email and email["tracking_number"] and not(str(email.get("status", "")).lower() == "delivered" or str(email.get("status", "")).lower() == "archive")
-    ]
-    return filtered_emails
+    try:
+        with open(input_file, "r", encoding="utf-8") as file:
+            emails = json.load(file)
+
+        # Filter emails based on tracking number and undelivered status
+        filtered_emails = [
+            email for email in emails
+            if str(email.get("status", "")).lower() not in {"delivered", "archive"}
+        ]
+
+        # Save the filtered emails to the output file
+        with open(output_file, "w", encoding="utf-8") as file:
+            json.dump(filtered_emails, file, indent=4)
+        
+        print(f"Filtered {len(filtered_emails)} emails for tracking and saved to {output_file}.")
+    except Exception as e:
+        print(f"Error filtering and saving tracking emails: {e}")
+
+
+def manually_update_delivery_status():
+    """
+    Interactive terminal command to manually update delivery status.
+    Goes through each email in emails_to_watch.json and updates emails.json.
+    """
+    try:
+        # Load emails to watch
+        with open("emails_to_watch.json", "r", encoding="utf-8") as file:
+            emails_to_watch = json.load(file)
+
+        # Load existing emails
+        with open("emails.json", "r", encoding="utf-8") as file:
+            emails = json.load(file)
+
+        # Create a lookup dictionary for emails by order_number
+        email_dict = {email.get("order_number"): email for email in emails if "order_number" in email}
+        
+        updated_emails_to_watch = []
+        
+        # Iterate through emails to watch
+        for email in emails_to_watch:
+            order_number = email.get("order_number")
+            tracking_number = email.get("tracking_number", "N/A")
+            latest_event = email.get("latest_event", {}).get("status", "No recent events")
+            subject = email.get("subject", "No subject")
+            sender = email.get("from", "No from available")
+            
+            print(f"Order Number: {order_number}")
+            print(f"Tracking Number: {tracking_number}")
+            print(f"Latest Event: {latest_event}")
+            print(f"Subject: {subject}")
+            print(f"from: {sender}")
+            print("=" * 50)
+            delivered = input("Is this package delivered? (y/n): ").strip().lower()
+
+            if delivered == "y":
+                # Update status to delivered
+                if order_number in email_dict:
+                    email_dict[order_number]["status"] = "Delivered"
+                    print(f"Marked order {order_number} as delivered.")
+                    
+                    # Also update the email in emails_to_watch.json
+                    email["status"] = "delivered"
+                else:
+                    print(f"Order number {order_number} not found in emails.json.")
+            elif delivered == "n":
+                print(f"Order {order_number} not marked as delivered.")
+            else:
+                print("Invalid input. Skipping...")
+                
+            # Append to updated list of emails to watch if not delivered
+            if str(email.get("status", "")).lower() != "delivered":
+                updated_emails_to_watch.append(email)
+
+        # Save updated emails back to emails.json
+        with open("emails.json", "w", encoding="utf-8") as file:
+            json.dump(list(email_dict.values()), file, indent=4)
+        print("Emails updated successfully.")
+        
+        # Save updated emails to watch back to emails_to_watch.json
+        with open("emails_to_watch.json", "w", encoding="utf-8") as file:
+            json.dump(updated_emails_to_watch, file, indent=4)
+        print("Emails_to_watch.json updated successfully.")
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Make sure 'emails_to_watch.json' and 'emails.json' exist.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
     
         
 # Run the email fetching and processing
-#fetch_and_save_email_ids(folder="\"Online Purchases\"", scan_all=False)
+fetch_and_save_email_ids(folder="\"Online Purchases\"", scan_all=False)
 
 # Create the OpenAI client for processing
-#_, _, openai_org, openai_project, api_key, _,_ = read_credentials("secrets.txt")
-#openai_client = OpenAI(organization=openai_org, project=openai_project, api_key=api_key)
+_, _, openai_org, openai_project, api_key, _,_ = read_credentials("secrets.txt")
+openai_client = OpenAI(organization=openai_org, project=openai_project, api_key=api_key)
 
-#process_and_save_emails(openai_client, folder="\"Online Purchases\"")
+process_and_save_emails(openai_client, folder="\"Online Purchases\"")
 
-#_, _, _, _, _, parcel_key,postal_code = read_credentials("secrets.txt")
-#delivered = check_package_status(parcel_key,postal_code)
+_, _, _, _, _, parcel_key,postal_code = read_credentials("secrets.txt")
+update_package_status(parcel_key,postal_code)
 
-# Usage in your main function
-with open("emails.json", "r", encoding="utf-8") as file:
-    emails = json.load(file)
+filter_and_save_tracking_emails("emails.json", "emails_to_watch.json")
 
-# Filter emails
-emails_to_track = filter_emails_with_tracking(emails)
+manually_update_delivery_status()
 
-# Write the JSON object to the file
-# Path to the file where the JSON will be saved
-file_path = "output.json"
-with open(file_path, "w", encoding="utf-8") as file:
-    json.dump(emails_to_track, file, indent=4)
