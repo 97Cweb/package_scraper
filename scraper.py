@@ -10,7 +10,8 @@ from bs4 import BeautifulSoup
 import regex as re
 import os
 import time
-
+import barcode
+from barcode.writer import ImageWriter
 
 # File to store the last scan date
 LAST_SCAN_FILE = "last_scan_date.txt"
@@ -461,33 +462,20 @@ def update_package_status(api_key,postal_code):
                     if email.get("tracking_number") == tracking_number:
                         email["status"] = status
                         email["delivered_by"] = delivered_by
-
+                        
+                        if status.lower() == "pickup": 
+                            generate_barcode(tracking_number)
+                            emailer.send_email( "Package ready for pickup", 
+                                                f"Package with tracking number {tracking_number} is ready for pickup", 
+                                                "97cweb@gmail.com",
+                                                tracking_number = tracking_number
+                                                )
+                        
                         # Check if status changed to delivered
                         if status.lower() == "delivered" and email not in delivered_packages:
-                            delivered_packages.append(email)
+                            emailer.send_email("Package Delivered", f"Package with tracking number {tracking_number} has been delivered", "97cweb@gmail.com")
                             print(f"Package {tracking_number} marked as delivered.")
 
-        # Process Amazon emails
-        for email in emails:
-            if any(domain in email.get("from", "").lower() for domain in ["amazon.com", "amazon.ca"]):
-                print(f"Processing Amazon email: {email['subject']}")
-
-                # Use GPT to extract status from Amazon emails
-                parsed_data = extract_with_gpt(email, openai_client)
-                if parsed_data:
-                    order_number = parsed_data.get("order_number")
-                    if order_number and order_number in email_lookup:
-                        # Update existing email entry
-                        email_lookup[order_number].update(parsed_data)
-                    elif order_number:
-                        # Add new entry if not already present
-                        email_lookup[order_number] = parsed_data
-
-                    # Check for delivered status
-                    status = str(parsed_data.get("status", "")).lower()
-                    if status == "delivered" and parsed_data not in delivered_packages:
-                        delivered_packages.append(parsed_data)
-                        print(f"Amazon package {order_number} marked as delivered.")
 
         # Save updated emails back to the JSON file
         updated_emails = list(email_lookup.values())
@@ -498,7 +486,6 @@ def update_package_status(api_key,postal_code):
     except Exception as e:
         print(f"Error checking package status: {e}")
 
-    return delivered_packages
 
 def filter_and_save_tracking_emails(input_file, output_file):
     """
@@ -565,6 +552,7 @@ def manually_update_delivery_status():
                     email_dict[order_number]["status"] = "Delivered"
                     print(f"Marked order {order_number} as delivered.")
                     
+                    
                     # Also update the email in emails_to_watch.json
                     email["status"] = "delivered"
                 else:
@@ -595,7 +583,8 @@ def manually_update_delivery_status():
         print(f"An unexpected error occurred: {e}")
 
     
-        
+
+      
 # Run the email fetching and processing
 fetch_and_save_email_ids(folder="\"Online Purchases\"", scan_all=False)
 
@@ -610,5 +599,5 @@ update_package_status(parcel_key,postal_code)
 
 filter_and_save_tracking_emails("emails.json", "emails_to_watch.json")
 
-manually_update_delivery_status()
+#manually_update_delivery_status()
 
